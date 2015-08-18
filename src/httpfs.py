@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+from __future__ import with_statement
 import os
 import sys
 import errno
@@ -9,6 +10,7 @@ import logging.handlers
 import array
 import resource
 from fuse import FUSE, FuseOSError, Operations
+from threading import Lock
 
 try:
     import urllib2 as urllib
@@ -121,7 +123,24 @@ class FDTable:
         return len(self.bitmap) * 8
 
 
+class SequentialFile(object):
+    def __init__(self, fobj):
+        self.fobj = fobj
+        self.offset = 0
+
+    def read(self, offset, length):
+        if self.offset != offset:
+            raise FuseOSError(errno.EINVAL)
+        b = self.fobj.read(length)
+        self.offset += len(b)
+        return b
+
+    def close(self):
+        self.fobj.close()
+
+
 class HttpFS(Operations):
+
     def __init__(self, url):
         if url[-1] != '/':
             url += '/'
@@ -129,6 +148,8 @@ class HttpFS(Operations):
         self.opener = urllib.build_opener()
         self.openfiles = dict()
         self.fd_table = FDTable(16)
+        self.file_class = SequentialFile
+        self.guard = Lock()
 
     # Helpers
     # =======
@@ -281,11 +302,12 @@ class HttpFS(Operations):
         try:
             logging.debug("open %s %s", path, flags)
             response = self.opener.open(self._url(path))
-            fd = self.fd_table.alloc_fd()
+            with self.guard:
+                fd = self.fd_table.alloc_fd()
             logging.debug("open -> %d", fd)
             if fd == -1:
                 raise FuseOSError(errno.EMFILE)
-            self.openfiles[fd] = response
+            self.openfiles[fd] = self.file_class(response)
             return fd
         except FuseOSError:
             raise
@@ -303,10 +325,10 @@ class HttpFS(Operations):
     def read(self, path, length, offset, fh):
         logging.debug("read %s %d %d %d", path, length, offset, fh)
         try:
-            fobj = self.openfiles[fh]
+            seq_file = self.openfiles[fh]
         except KeyError:
             raise FuseOSError(errno.EINVAL)
-        return fobj.read(length)
+        return seq_file.read(offset, length)
 
     def write(self, path, buf, offset, fh):
         logging.debug("write %s %s %d %d", path, buf, offset, fh)
@@ -335,7 +357,8 @@ class HttpFS(Operations):
 
 def parse_options(args):
     from argparse import ArgumentParser
-    parser = ArgumentParser(version="mount.httpfs 1.0")
+    parser = ArgumentParser()
+    parser.add_argument('-v', '--version', action='version', version='httpfs 1.0')
     parser.add_argument('source', nargs=1, help='site resource url')
     parser.add_argument('mountpoint', nargs=1, help='mount point')
     parser.add_argument("--debug", action='store_true', help='enable debug mode', default=False)
